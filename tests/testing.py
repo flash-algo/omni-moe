@@ -75,43 +75,6 @@ def _assert_allclose(out: Any, ref: Any, *, rtol: float, atol: float) -> None:
         raise AssertionError("Non-tensor outputs differ from baseline")
 
 
-def _assert_router_output_close(out: Any, ref: Any, *, rtol: float, atol: float) -> None:
-    """Special validation for router outputs that handles top-k ties correctly.
-    
-    For router outputs (scores, indices), we only validate scores since indices
-    can differ when multiple experts have the same score (tie-breaking behavior).
-    """
-    if not isinstance(out, (list, tuple)) or not isinstance(ref, (list, tuple)):
-        # Fallback to regular validation
-        _assert_allclose(out, ref, rtol=rtol, atol=atol)
-        return
-    
-    if len(out) != len(ref):
-        raise AssertionError(f"Output length mismatch: {len(out)} vs {len(ref)}")
-    
-    # For router: (scores, indices)
-    # Only validate scores, skip indices validation due to tie-breaking
-    if len(out) == 2 and torch.is_tensor(out[0]) and torch.is_tensor(out[1]):
-        scores_out, indices_out = out
-        scores_ref, indices_ref = ref
-        
-        # Validate scores
-        torch.testing.assert_close(scores_out, scores_ref, rtol=rtol, atol=atol)
-        
-        # For indices, only check that they are valid (in range), not exact match
-        # This is because when scores are tied, different implementations may
-        # select different experts, which is mathematically correct
-        if indices_out.dtype != indices_ref.dtype:
-            # Allow int32 vs int64 differences
-            pass
-        
-        # Note: We intentionally skip exact indices comparison
-        return
-    
-    # Fallback to regular validation for non-router outputs
-    _assert_allclose(out, ref, rtol=rtol, atol=atol)
-
-
 @dataclass
 class Implementation:
     """Wrapper describing a concrete kernel implementation."""
