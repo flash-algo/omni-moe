@@ -260,16 +260,25 @@ def _bwd_kernel_optimized(
     ix = indices // num_expert_sqrt
     iy = indices - ix * num_expert_sqrt
 
-    # Atomic accumulation with better memory access pattern
+    # Create valid mask to filter out invalid indices (indices = -1)
+    # This prevents incorrect memory access and accumulation
+    valid_indices = indices >= 0
+    ix_in_range = (ix >= 0) & (ix < num_expert_sqrt)
+    iy_in_range = (iy >= 0) & (iy < num_expert_sqrt)
+    
+    valid_mask_x = mask & valid_indices & ix_in_range
+    valid_mask_y = mask & valid_indices & iy_in_range
+
+    # Atomic accumulation with better memory access pattern and valid masks
     tl.atomic_add(
         dscores_x_ptr + ix * stride_dsxn,
         dscores,
-        mask=mask,
+        mask=valid_mask_x,
     )
     tl.atomic_add(
         dscores_y_ptr + iy * stride_dsyn,
         dscores,
-        mask=mask,
+        mask=valid_mask_y,
     )
 
 
