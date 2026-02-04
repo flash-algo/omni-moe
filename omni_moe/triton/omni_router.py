@@ -65,13 +65,16 @@ def _fwd_kernel(
         # Top-k selection
         # For triton, loop is faster than unrolling when num_experts is small
         for k in range(num_experts_per_token):
-            topk_scores = tl.max(scores, axis=0)
-            topk_indices = tl.argmax(scores, axis=0)
+            # Find max score and index
+            max_score = tl.max(scores, axis=0)
+            max_index = tl.argmax(scores, axis=0)
 
-            tl.store(scores_ptr + k * stride_sk, topk_scores, mask=mask_m)
-            tl.store(indices_ptr + k * stride_ik, topk_indices, mask=mask_m)
+            # Store score and index
+            tl.store(scores_ptr + k * stride_sk, max_score, mask=mask_m)
+            tl.store(indices_ptr + k * stride_ik, max_index, mask=mask_m)
 
-            scores = tl.where(offs_n == topk_indices, -float("inf"), scores)
+            # Set selected scores to -inf for next iteration
+            scores = tl.where(offs_n == max_index, -float("inf"), scores)
 
 
 @triton.autotune(
@@ -118,8 +121,8 @@ def _fwd_split_experts_kernel(
         indices_ptr = INDICES + m_idx * stride_im + offs_k * stride_ik
 
         # Initialize scores and indices
-        scores = tl.full((num_experts_per_token,), -float("inf"), dtype=tl.float32)
-        indices = tl.full((num_experts_per_token,), -1, dtype=tl.int32)
+        topk_scores = tl.full((num_experts_per_token,), -float("inf"), dtype=tl.float32)
+        topk_indices = tl.full((num_experts_per_token,), -1, dtype=tl.int32)
 
         # Loop over experts in blocks of TILE_N
         for start_expert in range(0, num_experts, TILE_N):
@@ -135,81 +138,58 @@ def _fwd_split_experts_kernel(
             mask = mask_n & mask_m
 
             # Load scores_x and scores_y
-            score_x = tl.load(
+            scores_x = tl.load(
                 scores_x_ptr + ix * stride_sxn,
                 mask=mask,
                 other=-float("inf"),
             )
-            score_y = tl.load(
+            scores_y = tl.load(
                 scores_y_ptr + iy * stride_syn,
                 mask=mask,
                 other=-float("inf"),
             )
 
             # Compute combined scores
-            score = (score_x + score_y).to(tl.float32)
+            scores = (scores_x + scores_y).to(tl.float32)
 
-            # Top-k selection between current block and previous top-k
-            topk_scores = tl.full(
-                (num_experts_per_token,), -float("inf"), dtype=score.dtype
-            )
-            topk_indices = tl.full((num_experts_per_token,), -1, dtype=tl.int32)
-
-            # Select top-k from current block
+            # Top-k selection within this block
             for k in range(num_experts_per_token):
-                max_score = tl.max(score, axis=0)
-                max_index = tl.argmax(score, axis=0)
-                topk_scores = tl.where(offs_k == k, max_score, topk_scores)
-                topk_indices = tl.where(
-                    offs_k == k, max_index + start_expert, topk_indices
-                )
-                score = tl.where(offs_nb == max_index, -float("inf"), score)
-
-            # Merge with previous top-k
-            new_topk_scores = tl.full(
-                (num_experts_per_token,), -float("inf"), dtype=score.dtype
-            )
-            new_topk_indices = tl.full((num_experts_per_token,), -1, dtype=tl.int32)
-
-            # Select top-k between scores and topk_scores
-            for k in range(num_experts_per_token):
+                # Find max score and index
                 max_score = tl.max(scores, axis=0)
                 max_index = tl.argmax(scores, axis=0)
-                max_topk_score = tl.max(topk_scores, axis=0)
-                max_topk_index = tl.argmax(topk_scores, axis=0)
 
-                take_from_scores = max_score >= max_topk_score
-                cand_scores_idx = tl.where(offs_k == max_index, indices, -1)
-                max_scores_idx = tl.max(cand_scores_idx, axis=0)
+                # Get current top-k score for comparison
+                current_score = tl.where(offs_k == k, topk_scores, -float("inf"))
+                current_max_score = tl.max(current_score, axis=0)
 
-                cand_topk_idx = tl.where(offs_k == max_topk_index, topk_indices, -1)
-                max_topk_idx = tl.max(cand_topk_idx, axis=0)
+                # Update top-k if found a better score
+                if max_score > current_max_score:
+                    # Shift down lower scores in top-k
+                    for shift_k in range(num_experts_per_token - 1, k, -1):
+                        prev_score = tl.where(offs_k == shift_k - 1, topk_scores, 0.0)
+                        prev_index = tl.where(offs_k == shift_k - 1, topk_indices, -1)
+                        topk_scores = tl.where(
+                            offs_k == shift_k,
+                            tl.max(prev_score, axis=0),
+                            topk_scores,
+                        )
+                        topk_indices = tl.where(
+                            offs_k == shift_k,
+                            tl.max(prev_index, axis=0),
+                            topk_indices,
+                        )
+                    topk_scores = tl.where(offs_k == k, max_score, topk_scores)
+                    topk_indices = tl.where(
+                        offs_k == k, max_index + start_expert, topk_indices
+                    )
 
-                chosen_score = tl.where(take_from_scores, max_score, max_topk_score)
-                chosen_index = tl.where(take_from_scores, max_scores_idx, max_topk_idx)
-
-                new_topk_scores = tl.where(offs_k == k, chosen_score, new_topk_scores)
-                new_topk_indices = tl.where(offs_k == k, chosen_index, new_topk_indices)
-
-                scores = tl.where(
-                    (offs_k == max_index) & (take_from_scores),
-                    -float("inf"),
-                    scores,
-                )
-                topk_scores = tl.where(
-                    (offs_k == max_topk_index) & (~take_from_scores),
-                    -float("inf"),
-                    topk_scores,
-                )
-
-            # Update scores and indices
-            scores = new_topk_scores
-            indices = new_topk_indices
+                    # Mask out selected element from scores
+                    scores = tl.where(offs_nb == max_index, -float("inf"), scores)
 
         # Store final top-k scores and indices
         mask = mask_m & (offs_k < num_experts_per_token)
-        tl.store(scores_ptr, scores, mask=mask)
-        tl.store(indices_ptr, indices, mask=mask)
+        tl.store(scores_ptr, topk_scores, mask=mask)
+        tl.store(indices_ptr, topk_indices, mask=mask)
 
 
 @triton.autotune(
@@ -268,25 +248,16 @@ def _bwd_kernel(
     ix = indices // num_expert_sqrt
     iy = indices - ix * num_expert_sqrt
 
-    # Create valid mask to filter out invalid indices (indices = -1)
-    # This prevents incorrect memory access and accumulation
-    valid_indices = indices >= 0
-    ix_in_range = (ix >= 0) & (ix < num_expert_sqrt)
-    iy_in_range = (iy >= 0) & (iy < num_expert_sqrt)
-    
-    valid_mask_x = mask & valid_indices & ix_in_range
-    valid_mask_y = mask & valid_indices & iy_in_range
-
-    # Atomic accumulation to dscores_x and dscores_y with valid masks
+    # Atomic accumulation to dscores_x and dscores_y
     tl.atomic_add(
         dscores_x_ptr + ix * stride_dsxn,
         dscores,
-        mask=valid_mask_x,
+        mask=mask,
     )
     tl.atomic_add(
         dscores_y_ptr + iy * stride_dsyn,
         dscores,
-        mask=valid_mask_y,
+        mask=mask,
     )
 
 
