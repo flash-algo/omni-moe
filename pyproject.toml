@@ -1,0 +1,49 @@
+[build-system]
+requires = [
+  "setuptools>=64",
+  "wheel",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omni-moe"
+dynamic = ["version"]
+description = "Omni MoE kernels."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.8"
+dependencies = [
+  "torch",
+  "triton",
+  "transformers",
+]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: Unix",
+]
+
+[project.urls]
+Homepage = "https://github.com/flash-algo/omni-moe"
+Source = "https://github.com/flash-algo/omni-moe"
+Issues = "https://github.com/flash-algo/omni-moe/issues"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=6.0",
+  "black",
+  "ruff",
+]
+
+[tool.setuptools.dynamic]
+version = { attr = "omni_moe.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["omni_moe*"]
+exclude = [
+  "build",
+  "dist",
+  "tests",
+]
+
