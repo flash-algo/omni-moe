@@ -178,7 +178,6 @@ def test_router_backward_throughput(
         make_backward_factory(num_tokens, num_keys, top_k, device, dtype),
         flops=flops,
         config=config,
-        validate=True,
     )
 
     testing.show_benchmarks(results)

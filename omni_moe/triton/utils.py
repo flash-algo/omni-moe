@@ -135,9 +135,9 @@ def get_router_fwd_autotune_configs():
         raise ValueError("Your device architecture is not supported for now.")
 
     configs = []
-    BLOCK_M_OPTIONS = [1, 64, 128, 256]
-    NUM_WARPS_OPTIONS = [4]
-    NUM_STAGES_OPTION = [1]
+    BLOCK_M_OPTIONS = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+    NUM_WARPS_OPTIONS = [2, 4]
+    NUM_STAGES_OPTION = [1, 2]
 
     for bm in BLOCK_M_OPTIONS:
         for nw in NUM_WARPS_OPTIONS:
@@ -169,8 +169,8 @@ def get_router_fwd_split_experts_autotune_configs():
     configs = []
     BLOCK_M_OPTIONS = [1]
     BLOCK_N_OPTIONS = [1024, 2048, 4096, 8192, 16384]
-    NUM_WARPS_OPTIONS = [4]
-    NUM_STAGES_OPTION = [1]
+    NUM_WARPS_OPTIONS = [2, 4]
+    NUM_STAGES_OPTION = [1, 2]
 
     for bm in BLOCK_M_OPTIONS:
         for bn in BLOCK_N_OPTIONS:
@@ -202,10 +202,10 @@ def get_router_bwd_autotune_configs():
         raise ValueError("Your device architecture is not supported for now.")
 
     configs = []
-    BLOCK_M_OPTIONS = [64, 128, 256]
+    BLOCK_M_OPTIONS = [32, 64, 128, 256]
     BLOCK_K_OPTIONS = [16, 32, 64]
-    NUM_WARPS_OPTIONS = [4]
-    NUM_STAGES_OPTION = [1]
+    NUM_WARPS_OPTIONS = [2, 4]
+    NUM_STAGES_OPTION = [1, 2]
 
     for bm in BLOCK_M_OPTIONS:
         for bk in BLOCK_K_OPTIONS:
