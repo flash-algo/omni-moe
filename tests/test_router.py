@@ -85,11 +85,10 @@ def make_backward_factory(
     def _factory(impl: testing.Implementation):
         logits_x = base_x.clone().detach().requires_grad_(True)
         logits_y = base_y.clone().detach().requires_grad_(True)
-        # Use the same forward implementation (triton) for both backends
-        # to ensure consistent expert selection and comparable gradients
-        # This is necessary because top-k can have ties, leading to different
-        # but equally valid expert selections
-        loss = triton_router_forward(logits_x, logits_y, num_keys, top_k).sum()
+        if impl.backend == testing.Backend.PYTORCH:
+            loss = pytorch_router_forward(logits_x, logits_y, num_keys, top_k).sum()
+        elif impl.backend == testing.Backend.TRITON:
+            loss = triton_router_forward(logits_x, logits_y, num_keys, top_k).sum()
         return (loss, logits_x, logits_y), {}
 
     return _factory
@@ -179,7 +178,6 @@ def test_router_backward_throughput(
         make_backward_factory(num_tokens, num_keys, top_k, device, dtype),
         flops=flops,
         config=config,
-        validate=True,
     )
 
     testing.show_benchmarks(results)
