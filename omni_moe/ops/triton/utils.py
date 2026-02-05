@@ -65,6 +65,19 @@ def ensure_contiguous(fn):
     return wrapper
 
 
+def assert_omni_mlp_fwd_inputs(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+):
+    assert gate.dim() == 2, (
+        "gate must be a 2D tensor of shape (batch_size * seq_len, hidden_size)"
+    )
+    assert up.dim() == 2, (
+        "up must be a 2D tensor of shape (batch_size * seq_len, hidden_size)"
+    )
+    assert gate.shape == up.shape, "gate and up must have the same shape"
+
+
 def assert_omni_router_fwd_inputs(
     router_logits_x: torch.Tensor,
     router_logits_y: torch.Tensor,
@@ -89,6 +102,12 @@ def assert_omni_router_fwd_inputs(
     assert num_experts_per_token % 2 == 0, (
         "num_experts_per_token should be a multiple of 2 for efficiency"
     )
+
+
+MLP_FWD_AUTOTUNE_KEYS = ["intermediate_size"]
+
+
+MLP_BWD_AUTOTUNE_KEYS = ["intermediate_size"]
 
 
 ROUTER_FWD_AUTOTUNE_KEYS = [
@@ -120,6 +139,70 @@ FWD_SCORES_GROUP_AUTOTUNE_KEYS = ["hidden_size"]
 
 
 FWD_STATES_GROUP_AUTOTUNE_KEYS = ["hidden_size"]
+
+
+def get_mlp_fwd_autotune_configs():
+    """
+    Get autotuning configurations for the MLP forward kernel.
+
+    :return configs: List of triton.Config objects
+    """
+    device = get_device()
+    arch = get_arch(device)
+
+    if arch == "N/A":
+        raise ValueError("Your device architecture is not supported for now.")
+
+    configs = []
+    BLOCK_K_OPTIONS = [1024, 2048, 4096, 8192, 16384, 32768, 65536]
+    NUM_WARPS_OPTIONS = [4, 8, 16, 32]
+    NUM_STAGES_OPTION = [1, 2]
+
+    for bk in BLOCK_K_OPTIONS:
+        for nw in NUM_WARPS_OPTIONS:
+            for ns in NUM_STAGES_OPTION:
+                configs.append(
+                    triton.Config(
+                        {
+                            "TILE_K": bk,
+                        },
+                        num_warps=nw,
+                        num_stages=ns,
+                    )
+                )
+    return configs
+
+
+def get_mlp_bwd_autotune_configs():
+    """
+    Get autotuning configurations for the MLP backward kernel.
+
+    :return configs: List of triton.Config objects
+    """
+    device = get_device()
+    arch = get_arch(device)
+
+    if arch == "N/A":
+        raise ValueError("Your device architecture is not supported for now.")
+
+    configs = []
+    BLOCK_K_OPTIONS = [1024, 2048, 4096, 8192, 16384, 32768, 65536]
+    NUM_WARPS_OPTIONS = [4, 8, 16, 32]
+    NUM_STAGES_OPTION = [1, 2]
+
+    for bk in BLOCK_K_OPTIONS:
+        for nw in NUM_WARPS_OPTIONS:
+            for ns in NUM_STAGES_OPTION:
+                configs.append(
+                    triton.Config(
+                        {
+                            "TILE_K": bk,
+                        },
+                        num_warps=nw,
+                        num_stages=ns,
+                    )
+                )
+    return configs
 
 
 def get_router_fwd_autotune_configs():
