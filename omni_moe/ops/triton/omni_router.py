@@ -2,7 +2,7 @@ import torch
 import triton
 from triton import language as tl
 
-from omni_moe.triton import utils
+from omni_moe.ops.triton import utils
 
 
 @triton.autotune(
