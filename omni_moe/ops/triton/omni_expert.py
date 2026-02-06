@@ -88,12 +88,9 @@ def _fwd_scores_tail_kernel(
 
 
 @triton.autotune(
+    configs=utils.get_expert_fwd_states_tail_autotune_configs(),
+    key=utils.EXPERT_FWD_STATES_TAIL_AUTOTUNE_KEYS,
     reset_to_zero=["Out"],
-)
-@triton.heuristics(
-    {
-        "EVEN_N": lambda args: args["hidden_size"] % args["BLOCK_N"] == 0,
-    }
 )
 @triton.jit
 def _fwd_states_tail_kernel(
@@ -101,7 +98,8 @@ def _fwd_states_tail_kernel(
     V,
     G,
     Out,
-    sorted_token_ids,
+    token_ids,
+    expert_ids,
     expert_offsets,
     stride_sm,
     stride_vk,
@@ -112,21 +110,24 @@ def _fwd_states_tail_kernel(
     stride_on,
     num_tokens,
     hidden_size: tl.constexpr,
-    EVEN_N: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
+    TILE_M: tl.constexpr,
+    TILE_N: tl.constexpr,
 ):
-    pid_k = tl.program_id(0)
-    pid_m = tl.program_id(1)
-    pid_n = tl.program_id(2)
+    m_block = tl.program_id(0)
+    n_block = tl.program_id(1)
+    k_idx = tl.program_id(2)
 
     # Initialize offsets
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_m = m_block * TILE_M + tl.arange(0, TILE_M)
+    offs_n = n_block * TILE_N + tl.arange(0, TILE_N)
+    mask_n = offs_n < hidden_size
 
     # Load segment boundaries
-    seg_start = tl.load(expert_offsets + pid_k)
-    seg_end = tl.load(expert_offsets + pid_k + 1)
+    seg_start = tl.load(expert_offsets + k_idx)
+    seg_end = tl.load(expert_offsets + k_idx + 1)
+
+    # Map compressed expert id to original expert id
+    expert_id = tl.load(expert_ids + k_idx)
 
     # Compute pair ids
     pair_ids = seg_start + offs_m
@@ -134,7 +135,7 @@ def _fwd_states_tail_kernel(
 
     # Load token ids
     token_ids = tl.load(
-        sorted_token_ids + pair_ids * stride_im,
+        token_ids + pair_ids * stride_im,
         mask=mask_m,
         other=0,
     )
@@ -143,7 +144,7 @@ def _fwd_states_tail_kernel(
     # Initialize pointers
     s_ptrs = S + pair_ids * stride_sm
     g_ptrs = G + pair_ids * stride_gm
-    v_ptrs = V + pid_k * stride_vk + offs_n * stride_vn
+    v_ptrs = V + expert_id * stride_vk + offs_n * stride_vn
     o_ptrs = Out + token_ids[:, None] * stride_om + offs_n[None, :] * stride_on
 
     # Load s
@@ -152,216 +153,155 @@ def _fwd_states_tail_kernel(
     g = tl.load(g_ptrs, mask=mask_m, other=0.0)
 
     # Compute gated s
-    gs = silu(s).cast(g.dtype) * g
+    gs = activations.silu(s).cast(g.dtype) * g
 
     # Load v
-    if EVEN_N:
-        v = tl.load(v_ptrs)
-    else:
-        v = tl.load(v_ptrs, mask=offs_n < hidden_size, other=0.0)
+    v = tl.load(v_ptrs, mask=mask_n, other=0.0)
     # Compute o
     o = gs[:, None] * v[None, :]
 
     # Write back o
-    if EVEN_N:
-        tl.atomic_add(o_ptrs, o, mask=mask_m[:, None])
-    else:
-        tl.atomic_add(
-            o_ptrs,
-            o,
-            mask=mask_m[:, None] & (offs_n[None, :] < hidden_size),
-        )
+    tl.atomic_add(
+        o_ptrs,
+        o,
+        mask=mask_m[:, None] & mask_n[None, :],
+    )
 
 
-@triton.heuristics(
-    {
-        "EVEN_N": lambda args: args["hidden_size"] % args["BLOCK_N"] == 0,
-    }
-)
-@triton.jit
-def _fwd_scores_group_kernel(
-    X,
-    W,
-    S,
-    token_rows,
-    group_offsets,
-    active_expert_ids,
-    stride_xm,
-    stride_xn,
-    stride_wk,
-    stride_wn,
-    stride_sm,
-    stride_sk,
-    stride_rm,
-    stride_off,
-    stride_am,
-    num_tokens,
-    num_experts,
-    num_active,
-    hidden_size: tl.constexpr,
-    GROUP_SIZE: tl.constexpr,
-    EVEN_N: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
+def _omni_expert_forward(
+    hidden_states: torch.Tensor,
+    up_weights: torch.Tensor,
+    down_weights: torch.Tensor,
+    routing_weights: torch.Tensor,
+    indices: torch.Tensor,
 ):
-    pid_g = tl.program_id(0)
-    pid_m = tl.program_id(1)
+    num_tokens, hidden_size = hidden_states.shape
+    num_experts = up_weights.shape[0]
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_k = tl.arange(0, GROUP_SIZE)
-    offs_nb = tl.arange(0, BLOCK_N)
-
-    seg_start = tl.load(group_offsets + pid_g * stride_off)
-    seg_end = tl.load(group_offsets + (pid_g + 1) * stride_off)
-
-    row_ids = seg_start + offs_m
-    mask_m = row_ids < seg_end
-
-    token_ids = tl.load(token_rows + row_ids * stride_rm, mask=mask_m, other=0)
-    mask_m &= token_ids < num_tokens
-
-    expert_comp_ids = pid_g * GROUP_SIZE + offs_k
-    mask_k = expert_comp_ids < num_active
-
-    expert_orig = tl.load(
-        active_expert_ids + expert_comp_ids * stride_am,
-        mask=mask_k,
-        other=0,
-    ).to(tl.int32)
-    mask_k &= expert_orig < num_experts
-
-    acc_s = tl.zeros((BLOCK_M, GROUP_SIZE), dtype=tl.float32)
-    x_ptrs = X + token_ids[:, None] * stride_xm
-
-    for start_n in range(0, hidden_size, BLOCK_N):
-        start_n = tl.multiple_of(start_n, BLOCK_N)
-        offs_n = start_n + offs_nb
-
-        if EVEN_N:
-            x = tl.load(
-                x_ptrs + offs_n[None, :] * stride_xn,
-                mask=mask_m[:, None],
-                other=0.0,
-            )
-        else:
-            x = tl.load(
-                x_ptrs + offs_n[None, :] * stride_xn,
-                mask=mask_m[:, None] & (offs_n[None, :] < hidden_size),
-                other=0.0,
-            )
-
-        w_tile = tl.load(
-            W + expert_orig[None, :] * stride_wk + offs_n[:, None] * stride_wn,
-            mask=mask_k[None, :]
-            if EVEN_N
-            else (mask_k[None, :] & (offs_n[:, None] < hidden_size)),
-            other=0.0,
-        )
-
-        acc_s += tl.dot(x, w_tile)
-
-    tl.store(
-        S + row_ids[:, None] * stride_sm + offs_k[None, :] * stride_sk,
-        acc_s,
-        mask=mask_m[:, None] & mask_k[None, :],
+    # Get scheduling info
+    scheduling_info = omni_scheduler.get_scheduling_info(
+        routing_weights,
+        indices,
+        num_experts,
+        group_size=16,  # minimum group size for matmul efficiency
     )
 
+    # Allocate outputs
+    tail_expert_weights = torch.empty(
+        scheduling_info.tail_token_ids.numel(),
+        device=hidden_states.device,
+        dtype=torch.float32,
+    )
+    out = torch.zeros_like(hidden_states)
 
-@triton.heuristics(
-    {
-        "EVEN_N": lambda args: args["hidden_size"] % args["BLOCK_N"] == 0,
-    }
-)
-@triton.jit
-def _fwd_states_group_kernel(
-    S,
-    V,
-    g_dense,
-    Out,
-    token_rows,
-    group_offsets,
-    active_expert_ids,
-    stride_sm,
-    stride_sk,
-    stride_vk,
-    stride_vn,
-    stride_gm,
-    stride_gk,
-    stride_om,
-    stride_on,
-    stride_rm,
-    stride_off,
-    stride_am,
-    num_tokens,
-    num_experts,
-    num_active,
-    hidden_size: tl.constexpr,
-    GROUP_SIZE: tl.constexpr,
-    EVEN_N: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
+    def tail_scores_grid(META):
+        return (
+            triton.cdiv(scheduling_info.max_tail_pairs_per_expert, META["TILE_M"]),
+            scheduling_info.num_tail_experts,
+        )
+
+    _fwd_scores_tail_kernel[tail_scores_grid](
+        hidden_states,
+        up_weights,
+        tail_expert_weights,
+        scheduling_info.tail_token_ids,
+        scheduling_info.tail_expert_ids,
+        scheduling_info.tail_offsets,
+        hidden_states.stride(0),
+        hidden_states.stride(1),
+        up_weights.stride(0),
+        up_weights.stride(1),
+        scheduling_info.tail_token_ids.stride(0),
+        num_tokens,
+        hidden_size=hidden_size,
+    )
+
+    def tail_states_grid(META):
+        return (
+            triton.cdiv(scheduling_info.max_tail_pairs_per_expert, META["TILE_M"]),
+            triton.cdiv(hidden_size, META["TILE_N"]),
+            scheduling_info.num_tail_experts,
+        )
+
+    _fwd_states_tail_kernel[tail_states_grid](
+        tail_expert_weights,
+        down_weights,
+        scheduling_info.tail_routing_weights,
+        out,
+        scheduling_info.tail_token_ids,
+        scheduling_info.tail_expert_ids,
+        scheduling_info.tail_offsets,
+        tail_expert_weights.stride(0),
+        down_weights.stride(0),
+        down_weights.stride(1),
+        scheduling_info.tail_routing_weights.stride(0),
+        scheduling_info.tail_token_ids.stride(0),
+        out.stride(0),
+        out.stride(1),
+        num_tokens,
+        hidden_size=hidden_size,
+    )
+
+    return out, scheduling_info
+
+
+class OmniExpertFunc(torch.autograd.Function):
+    @staticmethod
+    @utils.ensure_contiguous
+    def forward(ctx, hidden_states, up_weights, down_weights, routing_weights, indices):
+        experts_states, scheduling_info = _omni_expert_forward(
+            hidden_states,
+            up_weights,
+            down_weights,
+            routing_weights,
+            indices,
+        )
+
+        ctx.save_for_backward(
+            hidden_states,
+            up_weights,
+            down_weights,
+            routing_weights,
+        )
+
+        return experts_states
+
+    # @staticmethod
+    # @utils.ensure_contiguous
+    # def backward(ctx, dexperts_states):
+    #     (
+    #         hidden_states,
+    #         down_weights,
+    #         up_weights,
+    #         routing_weights,
+    #         expert_scores,
+    #         sorted_routing_weights,
+    #         sorted_token_ids,
+    #         expert_offsets,
+    #         sorted_pair_ids,
+    #     ) = ctx.saved_tensors
+
+    #     dhidden_states, ddown_weights, dup_weights, drouting_weights = (
+    #         _flash_expert_backward(
+    #             dexperts_states,
+    #             hidden_states,
+    #             down_weights,
+    #             up_weights,
+    #             routing_weights,
+    #             expert_scores,
+    #             sorted_routing_weights,
+    #             sorted_token_ids,
+    #             expert_offsets,
+    #             sorted_pair_ids,
+    #         )
+    #     )
+
+    #     return dhidden_states, ddown_weights, dup_weights, None, drouting_weights
+
+
+def triton_omni_expert_func(
+    hidden_states, up_weights, down_weights, routing_weights, indices
 ):
-    pid_g = tl.program_id(0)
-    pid_m = tl.program_id(1)
-    pid_n = tl.program_id(2)
-
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_k = tl.arange(0, GROUP_SIZE)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-
-    seg_start = tl.load(group_offsets + pid_g * stride_off)
-    seg_end = tl.load(group_offsets + (pid_g + 1) * stride_off)
-
-    row_ids = seg_start + offs_m
-    mask_m = row_ids < seg_end
-
-    token_ids = tl.load(token_rows + row_ids * stride_rm, mask=mask_m, other=0)
-    mask_m &= token_ids < num_tokens
-
-    expert_comp_ids = pid_g * GROUP_SIZE + offs_k
-    mask_k = expert_comp_ids < num_active
-
-    expert_orig = tl.load(
-        active_expert_ids + expert_comp_ids * stride_am,
-        mask=mask_k,
-        other=0,
-    ).to(tl.int32)
-    mask_k &= expert_orig < num_experts
-
-    s = tl.load(
-        S + row_ids[:, None] * stride_sm + offs_k[None, :] * stride_sk,
-        mask=mask_m[:, None] & mask_k[None, :],
-        other=0.0,
+    return OmniExpertFunc.apply(
+        hidden_states, up_weights, down_weights, routing_weights, indices
     )
-
-    g = tl.load(
-        g_dense + row_ids[:, None] * stride_gm + offs_k[None, :] * stride_gk,
-        mask=mask_m[:, None] & mask_k[None, :],
-        other=0.0,
-    )
-
-    gs = (silu(s) * g).to(g.dtype)
-
-    v_tile = tl.load(
-        V + expert_orig[:, None] * stride_vk + offs_n[None, :] * stride_vn,
-        mask=mask_k[:, None]
-        if EVEN_N
-        else (mask_k[:, None] & (offs_n[None, :] < hidden_size)),
-        other=0.0,
-    )
-
-    o = tl.dot(gs, v_tile)
-    o_ptrs = Out + token_ids[:, None] * stride_om
-
-    if EVEN_N:
-        tl.atomic_add(
-            o_ptrs + offs_n[None, :] * stride_on,
-            o.to(tl.float32),
-            mask=mask_m[:, None],
-        )
-    else:
-        tl.atomic_add(
-            o_ptrs + offs_n[None, :] * stride_on,
-            o.to(tl.float32),
-            mask=mask_m[:, None] & (offs_n[None, :] < hidden_size),
-        )
