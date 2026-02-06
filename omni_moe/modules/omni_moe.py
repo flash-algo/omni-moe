@@ -52,8 +52,8 @@ class OmniMoE(nn.Module):
         self.router_norm_y = nn.BatchNorm1d(self.num_expert_sqrt, affine=False)
 
         # routed experts
-        self.down_embed = nn.Embedding(self.num_experts, self.hidden_size)
         self.up_embed = nn.Embedding(self.num_experts, self.hidden_size)
+        self.down_embed = nn.Embedding(self.num_experts, self.hidden_size)
 
     def forward(
         self,
@@ -86,10 +86,10 @@ class OmniMoE(nn.Module):
         # mix routed experts states with shared expert states
         experts_states = triton_omni_expert_func(
             hidden_states,
-            self.down_embed.weight,
             self.up_embed.weight,
-            indices,
+            self.down_embed.weight,
             routing_weights,
+            indices,
         )
         hidden_states = triton_omni_mlp_func(
             hidden_states,
@@ -131,8 +131,8 @@ class OmniMoE_Pytorch(nn.Module):
         self.router_norm_y = nn.BatchNorm1d(self.num_expert_sqrt, affine=False)
 
         # routed experts
-        self.down_embed = nn.Embedding(self.num_experts, self.hidden_size)
         self.up_embed = nn.Embedding(self.num_experts, self.hidden_size)
+        self.down_embed = nn.Embedding(self.num_experts, self.hidden_size)
 
     def forward(
         self,
@@ -172,14 +172,14 @@ class OmniMoE_Pytorch(nn.Module):
         routing_weights = torch.exp(scores)
 
         # mix routed experts states with shared expert states
-        down_embed = self.down_embed(indices)
         up_embed = self.up_embed(indices)
+        down_embed = self.down_embed(indices)
         experts_weights = torch.matmul(
-            down_embed, hidden_states.view(bsz * seq_len, -1, 1)
+            up_embed, hidden_states.view(bsz * seq_len, -1, 1)
         ).view(bsz * seq_len, -1)
         experts_weights = self.act_fn(experts_weights) * routing_weights
         experts_states = torch.matmul(
-            experts_weights.view(bsz * seq_len, 1, -1), up_embed
+            experts_weights.view(bsz * seq_len, 1, -1), down_embed
         ).view(bsz, seq_len, -1)
         hidden_states = self.down_proj(
             self.act_fn(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
