@@ -116,7 +116,6 @@ def make_backward_factory(
     hidden_size: int,
     num_experts: int,
     top_k: int,
-    intermediate_size: int,
     device: torch.device,
     dtype: torch.dtype,
 ):
