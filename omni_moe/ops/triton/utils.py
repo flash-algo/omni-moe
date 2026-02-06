@@ -305,3 +305,73 @@ def get_router_bwd_autotune_configs():
                         )
                     )
     return configs
+
+
+def get_expert_fwd_scores_tail_autotune_configs():
+    """
+    Get autotuning configurations for the expert forward scores tail kernel.
+
+    :return configs: List of triton.Config objects
+    """
+    device = get_device()
+    arch = get_arch(device)
+
+    if arch == "N/A":
+        raise ValueError("Your device architecture is not supported for now.")
+
+    configs = []
+    BLOCK_M_OPTIONS = [32, 64, 128, 256]
+    BLOCK_N_OPTIONS = [32, 64, 128, 256]
+    NUM_WARPS_OPTIONS = [2, 4]
+    NUM_STAGES_OPTION = [1, 2]
+
+    for bm in BLOCK_M_OPTIONS:
+        for bn in BLOCK_N_OPTIONS:
+            for nw in NUM_WARPS_OPTIONS:
+                for ns in NUM_STAGES_OPTION:
+                    configs.append(
+                        triton.Config(
+                            {
+                                "TILE_M": bm,
+                                "TILE_N": bn,
+                            },
+                            num_warps=nw,
+                            num_stages=ns,
+                        )
+                    )
+    return configs
+
+
+def get_expert_fwd_states_tail_autotune_configs():
+    """
+    Get autotuning configurations for the expert forward states tail kernel.
+
+    :return configs: List of triton.Config objects
+    """
+    device = get_device()
+    arch = get_arch(device)
+
+    if arch == "N/A":
+        raise ValueError("Your device architecture is not supported for now.")
+
+    configs = []
+    BLOCK_M_OPTIONS = [32, 64, 128, 256]
+    BLOCK_N_OPTIONS = [32, 64, 128, 256]
+    NUM_WARPS_OPTIONS = [2, 4]
+    NUM_STAGES_OPTION = [1, 2]
+
+    for bm in BLOCK_M_OPTIONS:
+        for bn in BLOCK_N_OPTIONS:
+            for nw in NUM_WARPS_OPTIONS:
+                for ns in NUM_STAGES_OPTION:
+                    configs.append(
+                        triton.Config(
+                            {
+                                "TILE_M": bm,
+                                "TILE_N": bn,
+                            },
+                            num_warps=nw,
+                            num_stages=ns,
+                        )
+                    )
+    return configs
