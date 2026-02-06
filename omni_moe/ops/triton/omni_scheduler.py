@@ -45,6 +45,7 @@ def get_scheduling_info(
 
     # Determine if grouping is possible
     is_group = num_tokens * num_experts_per_token / num_experts >= group_size
+    is_group = False  # Disable grouping for now
 
     # Initialize basic info
     token_ids = (
@@ -66,14 +67,14 @@ def get_scheduling_info(
         tail_token_ids = token_ids[sorted_pair_ids]
         tail_routing_weights = G[sorted_pair_ids]
 
-        # Get unique tail experts
-        tail_expert_ids = torch.unique(sorted_expert_ids)
+        # Build compressed expert list and offsets from sorted pairs
+        tail_expert_ids, expert_counts = torch.unique_consecutive(
+            sorted_expert_ids, return_counts=True
+        )
         num_tail_experts = tail_expert_ids.numel()
 
-        # Create tail offsets
-        expert_counts = torch.bincount(sorted_expert_ids, minlength=num_experts)
         tail_offsets = torch.zeros(
-            num_experts + 1, dtype=torch.int32, device=Indices.device
+            num_tail_experts + 1, dtype=torch.int32, device=Indices.device
         )
         tail_offsets[1:] = torch.cumsum(expert_counts, dim=0)
 
