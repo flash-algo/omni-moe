@@ -168,7 +168,251 @@ def _fwd_states_tail_kernel(
     )
 
 
-def _omni_expert_forward(
+@triton.autotune(
+    configs=utils.get_expert_bwd_states_tail_autotune_configs(),
+    key=utils.EXPERT_BWD_STATES_TAIL_AUTOTUNE_KEYS,
+)
+@triton.jit
+def _bwd_states_tail_kernel(
+    V,
+    G,
+    S,
+    dO,
+    dG,
+    dS,
+    tail_token_ids,
+    tail_expert_ids,
+    tail_offsets,
+    tail_pair_ids,
+    stride_vk,
+    stride_vn,
+    stride_gm,
+    stride_sm,
+    stride_dom,
+    stride_don,
+    stride_dgm,
+    stride_dsm,
+    stride_im,
+    stride_pm,
+    num_tokens,
+    hidden_size: tl.constexpr,
+    TILE_M: tl.constexpr,
+    TILE_N: tl.constexpr,
+):
+    m_block = tl.program_id(0)
+    k_idx = tl.program_id(1)
+
+    # Initialize offsets
+    offs_m = m_block * TILE_M + tl.arange(0, TILE_M)
+    offs_nb = tl.arange(0, TILE_N)
+
+    # Load segment boundaries
+    seg_start = tl.load(tail_offsets + k_idx)
+    seg_end = tl.load(tail_offsets + k_idx + 1)
+
+    # Map compressed expert id to original expert id
+    expert_ids = tl.load(tail_expert_ids + k_idx)
+
+    # Compute pair ids
+    pair_ids = seg_start + offs_m
+    mask_m = pair_ids < seg_end
+
+    # Load token ids
+    token_ids = tl.load(
+        tail_token_ids + pair_ids * stride_im,
+        mask=mask_m,
+        other=0,
+    )
+    mask_m &= token_ids < num_tokens
+
+    # Load p
+    p = tl.load(tail_pair_ids + pair_ids * stride_pm, mask=mask_m, other=0)
+
+    # Initialize pointers
+    v_ptrs = V + expert_ids * stride_vk
+    g_ptrs = G + pair_ids * stride_gm
+    s_ptrs = S + pair_ids * stride_sm
+    do_ptrs = dO + token_ids[:, None] * stride_dom
+    dg_ptrs = dG + p * stride_dgm
+    ds_ptrs = dS + pair_ids * stride_dsm
+
+    # Load g
+    g = tl.load(g_ptrs, mask=mask_m, other=0.0)
+
+    # Load s
+    s = tl.load(s_ptrs, mask=mask_m, other=0.0).to(tl.float32)
+
+    # Initialize accumulator for dg
+    acc_dg = tl.zeros((TILE_M,), dtype=tl.float32)
+
+    # Loop over hidden dimension
+    for start_n in range(0, hidden_size, TILE_N):
+        start_n = tl.multiple_of(start_n, TILE_N)
+        offs_n = start_n + offs_nb
+        mask_n = offs_n < hidden_size
+
+        do = tl.load(
+            do_ptrs + offs_n[None, :] * stride_don,
+            mask=mask_m[:, None] & mask_n[None, :],
+            other=0.0,
+        )
+
+        v = tl.load(
+            v_ptrs + offs_n * stride_vn,
+            mask=mask_n,
+            other=0.0,
+        )
+
+        acc_dg += tl.sum(do * v[None, :], axis=1)
+
+    # recomputation to save memory
+    sig_s = tl.sigmoid(s)
+    dsilu = sig_s + s * sig_s * (1.0 - sig_s)
+
+    # Compute dg
+    dg = (acc_dg * sig_s * s).to(g.dtype)
+
+    # Store dg
+    tl.store(dg_ptrs, dg, mask=mask_m)
+
+    # Compute ds
+    ds = acc_dg * g.to(tl.float32) * dsilu
+
+    # Store ds
+    tl.store(ds_ptrs, ds, mask=mask_m)
+
+
+@triton.autotune(
+    configs=utils.get_expert_bwd_scores_tail_autotune_configs(),
+    key=utils.EXPERT_BWD_SCORES_TAIL_AUTOTUNE_KEYS,
+    reset_to_zero=["dX", "dW", "dV"],
+)
+@triton.jit
+def _bwd_scores_tail_kernel(
+    X,
+    W,
+    G,
+    S,
+    dO,
+    dX,
+    dW,
+    dV,
+    dS,
+    tail_token_ids,
+    tail_expert_ids,
+    tail_offsets,
+    stride_xm,
+    stride_xn,
+    stride_wk,
+    stride_wn,
+    stride_gm,
+    stride_sm,
+    stride_dom,
+    stride_don,
+    stride_dxm,
+    stride_dxn,
+    stride_dwk,
+    stride_dwn,
+    stride_dvk,
+    stride_dvn,
+    stride_dsm,
+    stride_im,
+    num_tokens,
+    hidden_size: tl.constexpr,
+    TILE_M: tl.constexpr,
+    TILE_N: tl.constexpr,
+):
+    m_block = tl.program_id(0)
+    n_block = tl.program_id(1)
+    k_idx = tl.program_id(2)
+
+    # Initialize offsets
+    offs_m = m_block * TILE_M + tl.arange(0, TILE_M)
+    offs_n = n_block * TILE_N + tl.arange(0, TILE_N)
+    mask_n = offs_n < hidden_size
+
+    # Load segment boundaries
+    seg_start = tl.load(tail_offsets + k_idx)
+    seg_end = tl.load(tail_offsets + k_idx + 1)
+
+    # Map compressed expert ids to original expert ids
+    expert_ids = tl.load(tail_expert_ids + k_idx)
+
+    # Compute pair ids
+    pair_ids = seg_start + offs_m
+    mask_m = pair_ids < seg_end
+
+    # Load token ids
+    token_ids = tl.load(
+        tail_token_ids + pair_ids * stride_im,
+        mask=mask_m,
+        other=0,
+    )
+    mask_m &= token_ids < num_tokens
+
+    # Initialize pointers
+    x_ptrs = X + token_ids[:, None] * stride_xm + offs_n[None, :] * stride_xn
+    w_ptrs = W + expert_ids * stride_wk + offs_n * stride_wn
+    g_ptrs = G + pair_ids * stride_gm
+    s_ptrs = S + pair_ids * stride_sm
+    do_ptrs = dO + token_ids[:, None] * stride_dom + offs_n[None, :] * stride_don
+    dx_ptrs = dX + token_ids[:, None] * stride_dxm + offs_n[None, :] * stride_dxn
+    dw_ptrs = dW + expert_ids * stride_dwk + offs_n * stride_dwn
+    dv_ptrs = dV + expert_ids * stride_dvk + offs_n * stride_dvn
+    ds_ptrs = dS + pair_ids * stride_dsm
+
+    # Load ds
+    ds = tl.load(ds_ptrs, mask=mask_m, other=0.0)
+
+    # Load w
+    w = tl.load(w_ptrs, mask=mask_n, other=0.0)
+
+    # Compute dx
+    dx = ds[:, None] * w[None, :]
+
+    # Store dx
+    tl.atomic_add(
+        dx_ptrs,
+        dx.to(w.dtype),
+        mask=mask_m[:, None] & mask_n[None, :],
+    )
+
+    # Load x
+    x = tl.load(
+        x_ptrs,
+        mask=mask_m[:, None] & mask_n[None, :],
+        other=0.0,
+    )
+
+    # Compute dw
+    dw = tl.sum(ds[:, None] * x, axis=0)
+
+    # Store dw
+    tl.atomic_add(dw_ptrs, dw.to(x.dtype), mask=mask_n)
+
+    # Load g
+    g = tl.load(g_ptrs, mask=mask_m, other=0.0)
+
+    # Load s
+    s = tl.load(s_ptrs, mask=mask_m, other=0.0)
+
+    gate = activations.silu(s) * g
+
+    # Load do
+    do = tl.load(
+        do_ptrs,
+        mask=mask_m[:, None] & mask_n[None, :],
+        other=0.0,
+    )
+
+    # Compute dv
+    dv = tl.sum(gate[:, None] * do, axis=0)
+
+    # Store dv
+    tl.atomic_add(dv_ptrs, dv.to(x.dtype), mask=mask_n)
+
+
+def omni_expert_forward(
     hidden_states: torch.Tensor,
     up_weights: torch.Tensor,
     down_weights: torch.Tensor,
@@ -242,14 +486,118 @@ def _omni_expert_forward(
         hidden_size=hidden_size,
     )
 
-    return out, scheduling_info
+    return out, tail_expert_weights, scheduling_info
+
+
+def omni_expert_backward(
+    do: torch.Tensor,
+    hidden_states: torch.Tensor,
+    up_weights: torch.Tensor,
+    down_weights: torch.Tensor,
+    routing_weights: torch.Tensor,
+    tail_expert_weights: torch.Tensor,
+    tail_routing_weights: torch.Tensor,
+    tail_token_ids: torch.Tensor,
+    tail_expert_ids: torch.Tensor,
+    tail_offsets: torch.Tensor,
+    tail_sorted_pair_ids: torch.Tensor,
+):
+    num_tokens, hidden_size = hidden_states.shape
+    num_tail_experts = tail_expert_ids.numel()
+
+    # recompute max_tail_pairs_per_expert because it is not saved in ctx
+    max_tail_pairs_per_expert = int(
+        torch.max(tail_offsets[1:] - tail_offsets[:-1]).item()
+    )
+
+    # Allocate outputs
+    dx = torch.zeros_like(hidden_states)
+    dw = torch.zeros_like(up_weights)
+    dv = torch.zeros_like(down_weights)
+    dg = torch.empty_like(routing_weights).view(-1)
+    ds = torch.empty_like(tail_expert_weights)
+
+    def tail_states_grid(META):
+        return (
+            triton.cdiv(max_tail_pairs_per_expert, META["TILE_M"]),
+            num_tail_experts,
+        )
+
+    _bwd_states_tail_kernel[tail_states_grid](
+        down_weights,
+        tail_routing_weights,
+        tail_expert_weights,
+        do,
+        dg,
+        ds,
+        tail_token_ids,
+        tail_expert_ids,
+        tail_offsets,
+        tail_sorted_pair_ids,
+        down_weights.stride(0),
+        down_weights.stride(1),
+        tail_routing_weights.stride(0),
+        tail_expert_weights.stride(0),
+        do.stride(0),
+        do.stride(1),
+        dg.stride(0),
+        ds.stride(0),
+        tail_token_ids.stride(0),
+        tail_sorted_pair_ids.stride(0),
+        num_tokens,
+        hidden_size=hidden_size,
+    )
+
+    def tail_scores_grid(META):
+        return (
+            triton.cdiv(max_tail_pairs_per_expert, META["TILE_M"]),
+            triton.cdiv(hidden_size, META["TILE_N"]),
+            num_tail_experts,
+        )
+
+    _bwd_scores_tail_kernel[tail_scores_grid](
+        hidden_states,
+        up_weights,
+        tail_routing_weights,
+        tail_expert_weights,
+        do,
+        dx,
+        dw,
+        dv,
+        ds,
+        tail_token_ids,
+        tail_expert_ids,
+        tail_offsets,
+        hidden_states.stride(0),
+        hidden_states.stride(1),
+        up_weights.stride(0),
+        up_weights.stride(1),
+        tail_routing_weights.stride(0),
+        tail_expert_weights.stride(0),
+        do.stride(0),
+        do.stride(1),
+        dx.stride(0),
+        dx.stride(1),
+        dw.stride(0),
+        dw.stride(1),
+        dv.stride(0),
+        dv.stride(1),
+        ds.stride(0),
+        tail_token_ids.stride(0),
+        num_tokens,
+        hidden_size=hidden_size,
+    )
+
+    dg = dg.view_as(routing_weights)
+
+    return dx, dw, dv, dg
 
 
 class OmniExpertFunc(torch.autograd.Function):
     @staticmethod
     @utils.ensure_contiguous
     def forward(ctx, hidden_states, up_weights, down_weights, routing_weights, indices):
-        experts_states, scheduling_info = _omni_expert_forward(
+        experts_states, tail_expert_weights, scheduling_info = omni_expert_forward(
             hidden_states,
             up_weights,
             down_weights,
@@ -262,41 +610,47 @@ class OmniExpertFunc(torch.autograd.Function):
             up_weights,
             down_weights,
             routing_weights,
+            tail_expert_weights,
+            scheduling_info.tail_routing_weights,
+            scheduling_info.tail_token_ids,
+            scheduling_info.tail_expert_ids,
+            scheduling_info.tail_offsets,
+            scheduling_info.tail_sorted_pair_ids,
         )
 
         return experts_states
 
-    # @staticmethod
-    # @utils.ensure_contiguous
-    # def backward(ctx, dexperts_states):
-    #     (
-    #         hidden_states,
-    #         down_weights,
-    #         up_weights,
-    #         routing_weights,
-    #         expert_scores,
-    #         sorted_routing_weights,
-    #         sorted_token_ids,
-    #         expert_offsets,
-    #         sorted_pair_ids,
-    #     ) = ctx.saved_tensors
+    @staticmethod
+    @utils.ensure_contiguous
+    def backward(ctx, do):
+        (
+            hidden_states,
+            up_weights,
+            down_weights,
+            routing_weights,
+            tail_expert_weights,
+            tail_routing_weights,
+            tail_token_ids,
+            tail_expert_ids,
+            tail_offsets,
+            tail_sorted_pair_ids,
+        ) = ctx.saved_tensors
 
-    #     dhidden_states, ddown_weights, dup_weights, drouting_weights = (
-    #         _flash_expert_backward(
-    #             dexperts_states,
-    #             hidden_states,
-    #             down_weights,
-    #             up_weights,
-    #             routing_weights,
-    #             expert_scores,
-    #             sorted_routing_weights,
-    #             sorted_token_ids,
-    #             expert_offsets,
-    #             sorted_pair_ids,
-    #         )
-    #     )
+        dx, dw, dv, dg = omni_expert_backward(
+            do,
+            hidden_states,
+            up_weights,
+            down_weights,
+            routing_weights,
+            tail_expert_weights,
+            tail_routing_weights,
+            tail_token_ids,
+            tail_expert_ids,
+            tail_offsets,
+            tail_sorted_pair_ids,
+        )
 
-    #     return dhidden_states, ddown_weights, dup_weights, None, drouting_weights
+        return dx, dw, dv, dg, None
 
 
 def triton_omni_expert_func(
