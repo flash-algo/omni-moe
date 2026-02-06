@@ -1,23 +1,21 @@
+import torch
 import triton
 from triton import language as tl
 
-
-@triton.jit
-def silu(x):
-    return x * tl.sigmoid(x)
+from omni_moe.ops.triton import utils, activations, omni_scheduler
 
 
-@triton.heuristics(
-    {
-        "EVEN_N": lambda args: args["hidden_size"] % args["BLOCK_N"] == 0,
-    }
+@triton.autotune(
+    configs=utils.get_expert_fwd_scores_tail_autotune_configs(),
+    key=utils.EXPERT_FWD_SCORES_TAIL_AUTOTUNE_KEYS,
 )
 @triton.jit
 def _fwd_scores_tail_kernel(
     X,
     W,
     S,
-    sorted_token_ids,
+    token_ids,
+    expert_ids,
     expert_offsets,
     stride_xm,
     stride_xn,
@@ -26,20 +24,22 @@ def _fwd_scores_tail_kernel(
     stride_im,
     num_tokens,
     hidden_size: tl.constexpr,
-    EVEN_N: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
+    TILE_M: tl.constexpr,
+    TILE_N: tl.constexpr,
 ):
-    pid_k = tl.program_id(0)
-    pid_m = tl.program_id(1)
+    m_block = tl.program_id(0)
+    k_idx = tl.program_id(1)
 
     # Initialize offsets
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_nb = tl.arange(0, BLOCK_N)
+    offs_m = m_block * TILE_M + tl.arange(0, TILE_M)
+    offs_nb = tl.arange(0, TILE_N)
 
     # Load segment boundaries
-    seg_start = tl.load(expert_offsets + pid_k)
-    seg_end = tl.load(expert_offsets + pid_k + 1)
+    seg_start = tl.load(expert_offsets + k_idx)
+    seg_end = tl.load(expert_offsets + k_idx + 1)
+
+    # Map compressed expert id to original expert id
+    expert_id = tl.load(expert_ids + k_idx)
 
     # Compute pair ids
     pair_ids = seg_start + offs_m
@@ -47,57 +47,44 @@ def _fwd_scores_tail_kernel(
 
     # Load token ids
     token_ids = tl.load(
-        sorted_token_ids + pair_ids * stride_im,
+        token_ids + pair_ids * stride_im,
         mask=mask_m,
-        other=0,
+        other=-1,
     )
     mask_m &= token_ids < num_tokens
 
     # Initialize pointers
     x_ptrs = X + token_ids[:, None] * stride_xm
-    w_ptrs = W + pid_k * stride_wk
+    w_ptrs = W + expert_id * stride_wk
 
     # Initialize accumulator for s
-    acc_s = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    acc_s = tl.zeros((TILE_M,), dtype=tl.float32)
 
     # Loop over hidden dimension
-    for start_n in range(0, hidden_size, BLOCK_N):
-        start_n = tl.multiple_of(start_n, BLOCK_N)
-        offs_n = start_n + offs_nb
+    for n_block in range(0, hidden_size, TILE_N):
+        n_block = tl.multiple_of(n_block, TILE_N)
+        offs_n = n_block + offs_nb
+        mask_n = offs_n < hidden_size
 
         # Load x
-        if EVEN_N:
-            x = tl.load(
-                x_ptrs + offs_n[None, :] * stride_xn,
-                mask=mask_m[:, None],
-                other=0.0,
-            )
-        else:
-            x = tl.load(
-                x_ptrs + offs_n[None, :] * stride_xn,
-                mask=mask_m[:, None] & (offs_n[None, :] < hidden_size),
-                other=0.0,
-            )
+        x = tl.load(
+            x_ptrs + offs_n[None, :] * stride_xn,
+            mask=mask_m[:, None] & mask_n[None, :],
+            other=0.0,
+        )
 
         # Load w
-        if EVEN_N:
-            w = tl.load(w_ptrs + offs_n * stride_wn)
-        else:
-            w = tl.load(
-                w_ptrs + offs_n * stride_wn,
-                mask=offs_n < hidden_size,
-                other=0.0,
-            )
+        w = tl.load(
+            w_ptrs + offs_n * stride_wn,
+            mask=mask_n,
+            other=0.0,
+        )
 
         # Compute s
         acc_s += tl.sum(x * w[None, :], axis=1)
 
     # Write back s
-    tl.store(
-        S + pair_ids,
-        acc_s,
-        mask=mask_m,
-    )
+    tl.store(S + pair_ids, acc_s, mask=mask_m)
 
 
 @triton.autotune(
