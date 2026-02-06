@@ -129,10 +129,10 @@ ROUTER_FWD_SPLIT_EXPERTS_AUTOTUNE_KEYS = [
 ROUTER_BWD_AUTOTUNE_KEYS = ["num_tokens", "num_expert_sqrt", "num_experts_per_token"]
 
 
-FWD_SCORES_TAIL_AUTOTUNE_KEYS = ["hidden_size"]
+EXPERT_FWD_SCORES_TAIL_AUTOTUNE_KEYS = ["num_tokens", "hidden_size"]
 
 
-FWD_STATES_TAIL_AUTOTUNE_KEYS = ["hidden_size"]
+EXPERT_FWD_STATES_TAIL_AUTOTUNE_KEYS = ["num_tokens", "hidden_size"]
 
 
 FWD_SCORES_GROUP_AUTOTUNE_KEYS = ["hidden_size"]
