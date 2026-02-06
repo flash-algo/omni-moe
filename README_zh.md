@@ -60,19 +60,18 @@ device = torch.device("cuda")
 dtype = torch.bfloat16
 
 config = OmniMoEConfig(
-    hidden_size=1024,
-    intermediate_size=4096,
-    hidden_act="silu",
-    num_experts=4096,
-    num_experts_per_tok=16,
-    norm_topk_prob=False,
+	hidden_size=1024,
+	intermediate_size=4096,
+	hidden_act="silu",
+	num_experts=4096,
+	num_experts_per_token=16,
 )
 
 x = torch.randn(1, 4096, config.hidden_size, device=device, dtype=dtype)
 moe = OmniMoE(config).to(device=device, dtype=dtype)
 
-y, router_logits = moe(x)
-print(y.shape, router_logits.shape)
+y = moe(x)
+print(y.shape)
 ```
 
 
