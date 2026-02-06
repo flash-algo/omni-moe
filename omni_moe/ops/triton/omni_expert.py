@@ -14,9 +14,9 @@ def _fwd_scores_tail_kernel(
     X,
     W,
     S,
-    token_ids,
-    expert_ids,
-    expert_offsets,
+    tail_token_ids,
+    tail_expert_ids,
+    tail_offsets,
     stride_xm,
     stride_xn,
     stride_wk,
@@ -35,11 +35,11 @@ def _fwd_scores_tail_kernel(
     offs_nb = tl.arange(0, TILE_N)
 
     # Load segment boundaries
-    seg_start = tl.load(expert_offsets + k_idx)
-    seg_end = tl.load(expert_offsets + k_idx + 1)
+    seg_start = tl.load(tail_offsets + k_idx)
+    seg_end = tl.load(tail_offsets + k_idx + 1)
 
     # Map compressed expert id to original expert id
-    expert_id = tl.load(expert_ids + k_idx)
+    expert_ids = tl.load(tail_expert_ids + k_idx)
 
     # Compute pair ids
     pair_ids = seg_start + offs_m
@@ -47,7 +47,7 @@ def _fwd_scores_tail_kernel(
 
     # Load token ids
     token_ids = tl.load(
-        token_ids + pair_ids * stride_im,
+        tail_token_ids + pair_ids * stride_im,
         mask=mask_m,
         other=-1,
     )
@@ -55,7 +55,7 @@ def _fwd_scores_tail_kernel(
 
     # Initialize pointers
     x_ptrs = X + token_ids[:, None] * stride_xm
-    w_ptrs = W + expert_id * stride_wk
+    w_ptrs = W + expert_ids * stride_wk
 
     # Initialize accumulator for s
     acc_s = tl.zeros((TILE_M,), dtype=tl.float32)
@@ -98,9 +98,9 @@ def _fwd_states_tail_kernel(
     V,
     G,
     Out,
-    token_ids,
-    expert_ids,
-    expert_offsets,
+    tail_token_ids,
+    tail_expert_ids,
+    tail_offsets,
     stride_sm,
     stride_vk,
     stride_vn,
@@ -123,29 +123,29 @@ def _fwd_states_tail_kernel(
     mask_n = offs_n < hidden_size
 
     # Load segment boundaries
-    seg_start = tl.load(expert_offsets + k_idx)
-    seg_end = tl.load(expert_offsets + k_idx + 1)
+    seg_start = tl.load(tail_offsets + k_idx)
+    seg_end = tl.load(tail_offsets + k_idx + 1)
 
     # Map compressed expert id to original expert id
-    expert_id = tl.load(expert_ids + k_idx)
+    expert_ids = tl.load(tail_expert_ids + k_idx)
 
     # Compute pair ids
     pair_ids = seg_start + offs_m
     mask_m = pair_ids < seg_end
 
     # Load token ids
-    token_ids = tl.load(
-        token_ids + pair_ids * stride_im,
+    tail_token_ids = tl.load(
+        tail_token_ids + pair_ids * stride_im,
         mask=mask_m,
         other=0,
     )
-    mask_m &= token_ids < num_tokens
+    mask_m &= tail_token_ids < num_tokens
 
     # Initialize pointers
     s_ptrs = S + pair_ids * stride_sm
     g_ptrs = G + pair_ids * stride_gm
-    v_ptrs = V + expert_id * stride_vk + offs_n * stride_vn
-    o_ptrs = Out + token_ids[:, None] * stride_om + offs_n[None, :] * stride_on
+    v_ptrs = V + expert_ids * stride_vk + offs_n * stride_vn
+    o_ptrs = Out + tail_token_ids[:, None] * stride_om + offs_n[None, :] * stride_on
 
     # Load s
     s = tl.load(s_ptrs, mask=mask_m, other=0.0)
