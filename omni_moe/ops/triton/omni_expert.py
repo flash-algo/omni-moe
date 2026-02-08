@@ -429,7 +429,7 @@ def _bwd_states_tail_kernel(
     )
     mask_m &= token_ids < num_tokens
 
-    # Load p
+    # Load pair ids for mapping back to original routing weights
     p = tl.load(tail_pair_ids + pair_ids * stride_pm, mask=mask_m, other=0)
 
     # Initialize pointers
@@ -444,7 +444,7 @@ def _bwd_states_tail_kernel(
     g = tl.load(g_ptrs, mask=mask_m, other=0.0)
 
     # Load s
-    s = tl.load(s_ptrs, mask=mask_m, other=0.0).to(tl.float32)
+    s = tl.load(s_ptrs, mask=mask_m, other=0.0)
 
     # Initialize accumulator for dg
     acc_dg = tl.zeros((TILE_M,), dtype=tl.float32)
@@ -594,13 +594,15 @@ def _bwd_scores_tail_kernel(
     # Store dw
     tl.atomic_add(dw_ptrs, dw.to(x.dtype), mask=mask_n)
 
-    # Load g
-    g = tl.load(g_ptrs, mask=mask_m, other=0.0)
-
     # Load s
     s = tl.load(s_ptrs, mask=mask_m, other=0.0)
 
-    gate = activations.silu(s) * g
+    silu_s = activations.silu(s)
+
+    # Load g
+    g = tl.load(g_ptrs, mask=mask_m, other=0.0)
+
+    gate = silu_s * g
 
     # Load do
     do = tl.load(
