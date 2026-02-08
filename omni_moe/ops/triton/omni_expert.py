@@ -991,7 +991,77 @@ def omni_expert_forward(
         hidden_size=hidden_size,
     )
 
-    return out, tail_expert_weights, scheduling_info
+    if scheduling_info.num_groups > 0:
+        # Allocate outputs
+        group_expert_weights = torch.empty(
+            scheduling_info.group_token_ids.numel(),
+            scheduling_info.group_expert_ids.shape[1],
+            device=hidden_states.device,
+            dtype=torch.float32,
+        )
+        group_out = torch.empty_like(hidden_states)
+
+        def group_scores_grid(META):
+            return (
+                triton.cdiv(scheduling_info.max_group_tokens, META["TILE_M"]),
+                triton.cdiv(scheduling_info.group_expert_ids.shape[1], META["TILE_K"]),
+                scheduling_info.num_groups,
+            )
+
+        _fwd_scores_group_kernel[group_scores_grid](
+            hidden_states,
+            up_weights,
+            group_expert_weights,
+            scheduling_info.group_token_ids,
+            scheduling_info.group_expert_ids,
+            scheduling_info.group_offsets,
+            hidden_states.stride(0),
+            hidden_states.stride(1),
+            up_weights.stride(0),
+            up_weights.stride(1),
+            group_expert_weights.stride(0),
+            group_expert_weights.stride(1),
+            num_tokens,
+            group_size=scheduling_info.group_expert_ids.shape[1],
+            hidden_size=hidden_size,
+        )
+
+        def group_states_grid(META):
+            return (
+                triton.cdiv(scheduling_info.max_group_tokens, META["TILE_M"]),
+                triton.cdiv(hidden_size, META["TILE_N"]),
+                scheduling_info.num_groups,
+            )
+
+        _fwd_states_group_kernel[group_states_grid](
+            group_expert_weights,
+            down_weights,
+            scheduling_info.group_routing_weights,
+            group_out,
+            scheduling_info.group_token_ids,
+            scheduling_info.group_expert_ids,
+            scheduling_info.group_offsets,
+            group_expert_weights.stride(0),
+            group_expert_weights.stride(1),
+            down_weights.stride(0),
+            down_weights.stride(1),
+            scheduling_info.group_routing_weights.stride(0),
+            scheduling_info.group_routing_weights.stride(1),
+            scheduling_info.group_token_ids.stride(0),
+            group_out.stride(0),
+            group_out.stride(1),
+            num_tokens,
+            group_size=scheduling_info.group_expert_ids.shape[1],
+            hidden_size=hidden_size,
+        )
+
+        out += group_out
+    else:
+        group_expert_weights = torch.empty(
+            0, device=hidden_states.device, dtype=torch.float32
+        )
+
+    return out, tail_expert_weights, group_expert_weights, scheduling_info
 
 
 def omni_expert_backward(
@@ -1006,21 +1076,28 @@ def omni_expert_backward(
     tail_expert_ids: torch.Tensor,
     tail_offsets: torch.Tensor,
     tail_sorted_pair_ids: torch.Tensor,
+    group_expert_weights: torch.Tensor,
+    group_routing_weights: torch.Tensor,
+    group_token_ids: torch.Tensor,
+    group_expert_ids: torch.Tensor,
+    group_offsets: torch.Tensor,
+    group_sorted_pair_ids: torch.Tensor,
 ):
     num_tokens, hidden_size = hidden_states.shape
     num_tail_experts = tail_expert_ids.numel()
 
-    # recompute max_tail_pairs_per_expert because it is not saved in ctx
+    # recompute max_tail_pairs_per_expert and num_groups because it is not saved in ctx
     max_tail_pairs_per_expert = int(
         torch.max(tail_offsets[1:] - tail_offsets[:-1]).item()
     )
+    num_groups = group_offsets.numel() - 1
 
     # Allocate outputs
-    dx = torch.zeros_like(hidden_states)
-    dw = torch.zeros_like(up_weights)
-    dv = torch.zeros_like(down_weights)
+    dx_tail = torch.zeros_like(hidden_states)
+    dw_tail = torch.zeros_like(up_weights)
+    dv_tail = torch.zeros_like(down_weights)
     dg = torch.empty_like(routing_weights).view(-1)
-    ds = torch.empty_like(tail_expert_weights)
+    ds_tail = torch.empty_like(tail_expert_weights)
 
     def tail_states_grid(META):
         return (
@@ -1034,7 +1111,7 @@ def omni_expert_backward(
         tail_expert_weights,
         do,
         dg,
-        ds,
+        ds_tail,
         tail_token_ids,
         tail_expert_ids,
         tail_offsets,
@@ -1046,7 +1123,7 @@ def omni_expert_backward(
         do.stride(0),
         do.stride(1),
         dg.stride(0),
-        ds.stride(0),
+        ds_tail.stride(0),
         tail_token_ids.stride(0),
         tail_sorted_pair_ids.stride(0),
         num_tokens,
@@ -1066,10 +1143,10 @@ def omni_expert_backward(
         tail_routing_weights,
         tail_expert_weights,
         do,
-        dx,
-        dw,
-        dv,
-        ds,
+        dx_tail,
+        dw_tail,
+        dv_tail,
+        ds_tail,
         tail_token_ids,
         tail_expert_ids,
         tail_offsets,
@@ -1081,17 +1158,119 @@ def omni_expert_backward(
         tail_expert_weights.stride(0),
         do.stride(0),
         do.stride(1),
-        dx.stride(0),
-        dx.stride(1),
-        dw.stride(0),
-        dw.stride(1),
-        dv.stride(0),
-        dv.stride(1),
-        ds.stride(0),
+        dx_tail.stride(0),
+        dx_tail.stride(1),
+        dw_tail.stride(0),
+        dw_tail.stride(1),
+        dv_tail.stride(0),
+        dv_tail.stride(1),
+        ds_tail.stride(0),
         tail_token_ids.stride(0),
         num_tokens,
         hidden_size=hidden_size,
     )
+
+    if num_groups > 0:
+        group_size = group_expert_ids.shape[1]
+
+        # recompute max_group_tokens
+        max_group_tokens = int(torch.max(group_offsets[1:] - group_offsets[:-1]).item())
+
+        # Allocate outputs
+        dx_group = torch.zeros_like(hidden_states)
+        dw_group = torch.zeros_like(up_weights)
+        dv_group = torch.zeros_like(down_weights)
+        ds_group = torch.empty_like(group_expert_weights)
+
+        def group_states_grid(META):
+            return (
+                triton.cdiv(max_group_tokens, META["TILE_M"]),
+                triton.cdiv(group_size, META["TILE_K"]),
+                num_groups,
+            )
+
+        _bwd_states_group_kernel[group_states_grid](
+            down_weights,
+            group_routing_weights,
+            group_expert_weights,
+            do,
+            dg,
+            ds_group,
+            group_token_ids,
+            group_expert_ids,
+            group_offsets,
+            group_sorted_pair_ids,
+            down_weights.stride(0),
+            down_weights.stride(1),
+            group_routing_weights.stride(0),
+            group_routing_weights.stride(1),
+            group_expert_weights.stride(0),
+            group_expert_weights.stride(1),
+            do.stride(0),
+            do.stride(1),
+            dg.stride(0),
+            ds_group.stride(0),
+            ds_group.stride(1),
+            group_token_ids.stride(0),
+            group_sorted_pair_ids.stride(0),
+            group_sorted_pair_ids.stride(1),
+            num_tokens,
+            group_size=group_size,
+            hidden_size=hidden_size,
+        )
+
+        def group_scores_grid(META):
+            return (
+                triton.cdiv(max_group_tokens, META["TILE_M"]),
+                triton.cdiv(hidden_size, META["TILE_N"]),
+                num_groups,
+            )
+
+        _bwd_scores_group_kernel[group_scores_grid](
+            hidden_states,
+            up_weights,
+            group_routing_weights,
+            group_expert_weights,
+            do,
+            dx_group,
+            dw_group,
+            dv_group,
+            ds_group,
+            group_token_ids,
+            group_expert_ids,
+            group_offsets,
+            hidden_states.stride(0),
+            hidden_states.stride(1),
+            up_weights.stride(0),
+            up_weights.stride(1),
+            group_routing_weights.stride(0),
+            group_routing_weights.stride(1),
+            group_expert_weights.stride(0),
+            group_expert_weights.stride(1),
+            do.stride(0),
+            do.stride(1),
+            dx_group.stride(0),
+            dx_group.stride(1),
+            dw_group.stride(0),
+            dw_group.stride(1),
+            dv_group.stride(0),
+            dv_group.stride(1),
+            ds_group.stride(0),
+            ds_group.stride(1),
+            group_token_ids.stride(0),
+            num_tokens,
+            group_size=group_size,
+            hidden_size=hidden_size,
+        )
+
+    if num_groups > 0:
+        dx = dx_tail + dx_group
+        dw = dw_tail + dw_group
+        dv = dv_tail + dv_group
+    else:
+        dx = dx_tail
+        dw = dw_tail
+        dv = dv_tail
 
     dg = dg.view_as(routing_weights)
 
@@ -1102,12 +1281,14 @@ class OmniExpertFunc(torch.autograd.Function):
     @staticmethod
     @utils.ensure_contiguous
     def forward(ctx, hidden_states, up_weights, down_weights, routing_weights, indices):
-        experts_states, tail_expert_weights, scheduling_info = omni_expert_forward(
-            hidden_states,
-            up_weights,
-            down_weights,
-            routing_weights,
-            indices,
+        experts_states, tail_expert_weights, group_expert_weights, scheduling_info = (
+            omni_expert_forward(
+                hidden_states,
+                up_weights,
+                down_weights,
+                routing_weights,
+                indices,
+            )
         )
 
         ctx.save_for_backward(
@@ -1121,6 +1302,12 @@ class OmniExpertFunc(torch.autograd.Function):
             scheduling_info.tail_expert_ids,
             scheduling_info.tail_offsets,
             scheduling_info.tail_sorted_pair_ids,
+            group_expert_weights,
+            scheduling_info.group_routing_weights,
+            scheduling_info.group_token_ids,
+            scheduling_info.group_expert_ids,
+            scheduling_info.group_offsets,
+            scheduling_info.group_sorted_pair_ids,
         )
 
         return experts_states
@@ -1139,6 +1326,12 @@ class OmniExpertFunc(torch.autograd.Function):
             tail_expert_ids,
             tail_offsets,
             tail_sorted_pair_ids,
+            group_expert_weights,
+            group_routing_weights,
+            group_token_ids,
+            group_expert_ids,
+            group_offsets,
+            group_sorted_pair_ids,
         ) = ctx.saved_tensors
 
         dx, dw, dv, dg = omni_expert_backward(
@@ -1153,6 +1346,12 @@ class OmniExpertFunc(torch.autograd.Function):
             tail_expert_ids,
             tail_offsets,
             tail_sorted_pair_ids,
+            group_expert_weights,
+            group_routing_weights,
+            group_token_ids,
+            group_expert_ids,
+            group_offsets,
+            group_sorted_pair_ids,
         )
 
         return dx, dw, dv, dg, None
