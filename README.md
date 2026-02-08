@@ -103,4 +103,16 @@ See [LICENSE](LICENSE).
 
 ## Citation
 
-paper is coming soon.
+If you find this work useful, please consider citing:
+
+```bibtex
+@misc{shi2026omnimoe,
+      title={OmniMoE: An Efficient MoE by Orchestrating Atomic Experts at Scale}, 
+      author={Jingze Shi and Zhangyang Peng and Yizhang Zhu and Yifan Wu and Guang Liu and Yuyu Luo},
+      year={2026},
+      eprint={2602.05711},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2602.05711}, 
+}
+```
