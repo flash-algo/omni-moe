@@ -135,10 +135,10 @@ EXPERT_FWD_SCORES_TAIL_AUTOTUNE_KEYS = ["num_tokens", "hidden_size"]
 EXPERT_FWD_STATES_TAIL_AUTOTUNE_KEYS = ["num_tokens", "hidden_size"]
 
 
-FWD_SCORES_GROUP_AUTOTUNE_KEYS = ["hidden_size"]
+EXPERT_FWD_SCORES_GROUP_AUTOTUNE_KEYS = ["hidden_size", "group_size", "hidden_size"]
 
 
-FWD_STATES_GROUP_AUTOTUNE_KEYS = ["hidden_size"]
+EXPERT_FWD_STATES_GROUP_AUTOTUNE_KEYS = ["hidden_size", "group_size", "hidden_size"]
 
 
 EXPERT_BWD_STATES_TAIL_AUTOTUNE_KEYS = ["num_tokens", "hidden_size"]
@@ -348,6 +348,44 @@ def get_expert_fwd_scores_tail_autotune_configs():
     return configs
 
 
+def get_expert_fwd_scores_group_autotune_configs():
+    """
+    Get autotuning configurations for the expert forward scores group kernel.
+
+    :return configs: List of triton.Config objects
+    """
+    device = get_device()
+    arch = get_arch(device)
+
+    if arch == "N/A":
+        raise ValueError("Your device architecture is not supported for now.")
+
+    configs = []
+    BLOCK_M_OPTIONS = [32, 64, 128]
+    BLOCK_N_OPTIONS = [32, 64, 128]
+    BLOCK_K_OPTIONS = [16, 32, 64]
+    NUM_WARPS_OPTIONS = [2, 4]
+    NUM_STAGES_OPTION = [1, 2]
+
+    for bm in BLOCK_M_OPTIONS:
+        for bn in BLOCK_N_OPTIONS:
+            for bk in BLOCK_K_OPTIONS:
+                for nw in NUM_WARPS_OPTIONS:
+                    for ns in NUM_STAGES_OPTION:
+                        configs.append(
+                            triton.Config(
+                                {
+                                    "TILE_M": bm,
+                                    "TILE_N": bn,
+                                    "TILE_K": bk,
+                                },
+                                num_warps=nw,
+                                num_stages=ns,
+                            )
+                        )
+    return configs
+
+
 def get_expert_fwd_states_tail_autotune_configs():
     """
     Get autotuning configurations for the expert forward states tail kernel.
@@ -380,6 +418,44 @@ def get_expert_fwd_states_tail_autotune_configs():
                             num_stages=ns,
                         )
                     )
+    return configs
+
+
+def get_expert_fwd_states_group_autotune_configs():
+    """
+    Get autotuning configurations for the expert forward states group kernel.
+
+    :return configs: List of triton.Config objects
+    """
+    device = get_device()
+    arch = get_arch(device)
+
+    if arch == "N/A":
+        raise ValueError("Your device architecture is not supported for now.")
+
+    configs = []
+    BLOCK_M_OPTIONS = [32, 64, 128]
+    BLOCK_N_OPTIONS = [32, 64, 128]
+    BLOCK_K_OPTIONS = [16, 32, 64]
+    NUM_WARPS_OPTIONS = [2, 4]
+    NUM_STAGES_OPTION = [1, 2]
+
+    for bm in BLOCK_M_OPTIONS:
+        for bn in BLOCK_N_OPTIONS:
+            for bk in BLOCK_K_OPTIONS:
+                for nw in NUM_WARPS_OPTIONS:
+                    for ns in NUM_STAGES_OPTION:
+                        configs.append(
+                            triton.Config(
+                                {
+                                    "TILE_M": bm,
+                                    "TILE_N": bn,
+                                    "TILE_K": bk,
+                                },
+                                num_warps=nw,
+                                num_stages=ns,
+                            )
+                        )
     return configs
 
 
