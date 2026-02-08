@@ -103,4 +103,16 @@ pytest tests/test_expert.py -s
 
 ## Citation
 
-paper is coming soon.
+如果你认为 OmniMoE 对你的研究有帮助, 请考虑引用:
+
+```bibtex
+@misc{shi2026omnimoe,
+      title={OmniMoE: An Efficient MoE by Orchestrating Atomic Experts at Scale}, 
+      author={Jingze Shi and Zhangyang Peng and Yizhang Zhu and Yifan Wu and Guang Liu and Yuyu Luo},
+      year={2026},
+      eprint={2602.05711},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2602.05711}, 
+}
+```
