@@ -476,13 +476,13 @@ def _bwd_states_tail_kernel(
     # Compute dg
     dg = (acc_dg * sig_s * s).to(g.dtype)
 
-    # Store dg
+    # Write back dg
     tl.store(dg_ptrs, dg, mask=mask_m)
 
     # Compute ds
     ds = acc_dg * g.to(tl.float32) * dsilu
 
-    # Store ds
+    # Write back ds
     tl.store(ds_ptrs, ds, mask=mask_m)
 
 
@@ -574,7 +574,7 @@ def _bwd_scores_tail_kernel(
     # Compute dx
     dx = ds[:, None] * w[None, :]
 
-    # Store dx
+    # Write back dx
     tl.atomic_add(
         dx_ptrs,
         dx.to(w.dtype),
@@ -591,7 +591,7 @@ def _bwd_scores_tail_kernel(
     # Compute dw
     dw = tl.sum(ds[:, None] * x, axis=0)
 
-    # Store dw
+    # Write back dw
     tl.atomic_add(dw_ptrs, dw.to(x.dtype), mask=mask_n)
 
     # Load s
@@ -614,8 +614,307 @@ def _bwd_scores_tail_kernel(
     # Compute dv
     dv = tl.sum(gate[:, None] * do, axis=0)
 
-    # Store dv
+    # Write back dv
     tl.atomic_add(dv_ptrs, dv.to(x.dtype), mask=mask_n)
+
+
+@triton.autotune(
+    configs=utils.get_expert_bwd_states_group_autotune_configs(),
+    key=utils.EXPERT_BWD_STATES_GROUP_AUTOTUNE_KEYS,
+)
+@triton.jit
+def _bwd_states_group_kernel(
+    V,
+    G,
+    S,
+    dO,
+    dG,
+    dS,
+    group_token_ids,
+    group_expert_ids,
+    group_offsets,
+    group_sorted_pair_ids,
+    stride_vk,
+    stride_vn,
+    stride_gm,
+    stride_gk,
+    stride_sm,
+    stride_sk,
+    stride_dom,
+    stride_don,
+    stride_dgm,
+    stride_dsm,
+    stride_dsk,
+    stride_im,
+    stride_pm,
+    stride_pk,
+    num_tokens,
+    group_size: tl.constexpr,
+    hidden_size: tl.constexpr,
+    TILE_M: tl.constexpr,
+    TILE_N: tl.constexpr,
+    TILE_K: tl.constexpr,
+):
+    m_block = tl.program_id(0)
+    k_block = tl.program_id(1)
+    g_idx = tl.program_id(2)
+
+    # Initialize offsets
+    offs_m = m_block * TILE_M + tl.arange(0, TILE_M)
+    offs_k = k_block * TILE_K + tl.arange(0, TILE_K)
+    offs_nb = tl.arange(0, TILE_N)
+
+    # Load segment boundaries
+    seg_start = tl.load(group_offsets + g_idx)
+    seg_end = tl.load(group_offsets + g_idx + 1)
+
+    # Compute row ids
+    row_ids = seg_start + offs_m
+    mask_m = row_ids < seg_end
+    mask_k = offs_k < group_size
+
+    # Load token ids
+    token_ids = tl.load(
+        group_token_ids + row_ids * stride_im,
+        mask=mask_m,
+        other=0,
+    )
+    mask_m &= token_ids < num_tokens
+
+    # Load expert ids
+    expert_ids = tl.load(
+        group_expert_ids + g_idx * group_size + offs_k,
+        mask=mask_k,
+        other=0,
+    )
+
+    # Load pair ids for mapping back to original routing weights
+    p = tl.load(
+        group_sorted_pair_ids
+        + row_ids[:, None] * stride_pm
+        + offs_k[None, :] * stride_pk,
+        mask=mask_m[:, None] & mask_k[None, :],
+        other=0,
+    )
+
+    # Initialize pointers
+    v_ptrs = V + expert_ids[None, :] * stride_vk
+    g_ptrs = G + row_ids[:, None] * stride_gm + offs_k[None, :] * stride_gk
+    s_ptrs = S + row_ids[:, None] * stride_sm + offs_k[None, :] * stride_sk
+    do_ptrs = dO + token_ids[:, None] * stride_dom
+    dg_ptrs = dG + p * stride_dgm
+    ds_ptrs = dS + row_ids[:, None] * stride_dsm + offs_k[None, :] * stride_dsk
+
+    # Initialize accumulator for dgs
+    acc_dgs = tl.zeros((TILE_M, TILE_K), dtype=tl.float32)
+
+    # Loop over hidden dimension
+    for n_block in range(0, hidden_size, TILE_N):
+        n_block = tl.multiple_of(n_block, TILE_N)
+        offs_n = n_block + offs_nb
+        mask_n = offs_n < hidden_size
+
+        # Load do
+        do = tl.load(
+            do_ptrs + offs_n[None, :] * stride_don,
+            mask=mask_m[:, None] & mask_n[None, :],
+            other=0.0,
+        )
+
+        # Load v
+        v = tl.load(
+            v_ptrs + offs_n[:, None] * stride_vn,
+            mask=mask_n[:, None] & mask_k[None, :],
+            other=0.0,
+        )
+
+        # Compute dgs
+        acc_dgs += tl.dot(do, v)
+
+    # Load g
+    g = tl.load(g_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
+
+    # Load s
+    s = tl.load(s_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
+
+    # Recomputation to save memory
+    sig_s = tl.sigmoid(s)
+    dsilu = sig_s + s * sig_s * (1.0 - sig_s)
+
+    # Compute dg
+    dg = (acc_dgs * sig_s * s).to(g.dtype)
+
+    # Write back dg
+    tl.store(dg_ptrs, dg, mask=mask_m[:, None] & mask_k[None, :])
+
+    # Compute ds
+    ds = acc_dgs * g.to(tl.float32) * dsilu
+
+    # Write back ds
+    tl.store(ds_ptrs, ds, mask=mask_m[:, None] & mask_k[None, :])
+
+
+@triton.autotune(
+    configs=utils.get_expert_bwd_scores_group_autotune_configs(),
+    key=utils.EXPERT_BWD_SCORES_GROUP_AUTOTUNE_KEYS,
+    reset_to_zero=["dX", "dW", "dV"],
+)
+@triton.jit
+def _bwd_scores_group_kernel(
+    X,
+    W,
+    G,
+    S,
+    dO,
+    dX,
+    dW,
+    dV,
+    dS,
+    group_token_ids,
+    group_expert_ids,
+    group_offsets,
+    stride_xm,
+    stride_xn,
+    stride_wk,
+    stride_wn,
+    stride_gm,
+    stride_gk,
+    stride_sm,
+    stride_sk,
+    stride_dom,
+    stride_don,
+    stride_dxm,
+    stride_dxn,
+    stride_dwk,
+    stride_dwn,
+    stride_dvk,
+    stride_dvn,
+    stride_dsm,
+    stride_dsk,
+    stride_im,
+    num_tokens,
+    group_size: tl.constexpr,
+    hidden_size: tl.constexpr,
+    TILE_M: tl.constexpr,
+    TILE_N: tl.constexpr,
+    TILE_K: tl.constexpr,
+):
+    m_block = tl.program_id(0)
+    n_block = tl.program_id(1)
+    g_idx = tl.program_id(2)
+
+    # Initialize offsets
+    offs_m = m_block * TILE_M + tl.arange(0, TILE_M)
+    offs_n = n_block * TILE_N + tl.arange(0, TILE_N)
+    mask_n = offs_n < hidden_size
+
+    # Load segment boundaries
+    seg_start = tl.load(group_offsets + g_idx)
+    seg_end = tl.load(group_offsets + g_idx + 1)
+
+    # Compute row ids
+    row_ids = seg_start + offs_m
+    mask_m = row_ids < seg_end
+
+    # Load token ids
+    token_ids = tl.load(
+        group_token_ids + row_ids * stride_im,
+        mask=mask_m,
+        other=0,
+    )
+    mask_m &= token_ids < num_tokens
+
+    # Initialize pointers
+    x_ptrs = X + token_ids[:, None] * stride_xm + offs_n[None, :] * stride_xn
+    w_ptrs = W + offs_n[None, :] * stride_wn
+    g_ptrs = G + row_ids[:, None] * stride_gm
+    s_ptrs = S + row_ids[:, None] * stride_sm
+    do_ptrs = dO + token_ids[:, None] * stride_dom + offs_n[None, :] * stride_don
+    dx_ptrs = dX + token_ids[:, None] * stride_dxm + offs_n[None, :] * stride_dxn
+    dw_ptrs = dW + offs_n[None, :] * stride_dwn
+    dv_ptrs = dV + offs_n[None, :] * stride_dvn
+    ds_ptrs = dS + row_ids[:, None] * stride_dsm
+
+    # Load x
+    x = tl.load(x_ptrs, mask=mask_m[:, None] & mask_n[None, :], other=0.0)
+
+    # Load do
+    do = tl.load(do_ptrs, mask=mask_m[:, None] & mask_n[None, :], other=0.0)
+
+    # Initialize accumulator for dx
+    acc_dx = tl.zeros((TILE_M, TILE_N), dtype=tl.float32)
+
+    # Loop over expert dimension
+    for k_block in range(0, group_size, TILE_K):
+        offs_k = k_block + tl.arange(0, TILE_K)
+        mask_k = offs_k < group_size
+
+        # Load expert ids
+        expert_ids = tl.load(
+            group_expert_ids + g_idx * group_size + offs_k,
+            mask=mask_k,
+            other=0,
+        )
+
+        # Load w
+        w = tl.load(
+            w_ptrs + expert_ids[:, None] * stride_wk,
+            mask=mask_k[:, None] & mask_n[None, :],
+            other=0.0,
+        )
+
+        # Load ds
+        ds = tl.load(
+            ds_ptrs + offs_k[None, :] * stride_dsk,
+            mask=mask_m[:, None] & mask_k[None, :],
+            other=0.0,
+        ).to(w.dtype)
+
+        # Compute dx
+        acc_dx += tl.dot(ds, w)
+
+        # Compute dw
+        dw = tl.dot(tl.trans(ds), x)
+
+        # Write back dw
+        tl.atomic_add(
+            dw_ptrs + expert_ids[:, None] * stride_dwk,
+            dw.to(x.dtype),
+            mask=mask_k[:, None] & mask_n[None, :],
+        )
+
+        # Load s
+        s = tl.load(
+            s_ptrs + offs_k[None, :] * stride_sk,
+            mask=mask_m[:, None] & mask_k[None, :],
+            other=0.0,
+        )
+
+        # Compute silu_s
+        silu_s = activations.silu(s)
+
+        # Load g
+        g = tl.load(
+            g_ptrs + offs_k[None, :] * stride_gk,
+            mask=mask_m[:, None] & mask_k[None, :],
+            other=0.0,
+        )
+
+        # Compute gate
+        gate = (silu_s * g).to(do.dtype)
+
+        # Compute dv
+        dv = tl.dot(tl.trans(gate), do)
+
+        # Write back dv
+        tl.atomic_add(
+            dv_ptrs + expert_ids[:, None] * stride_dvk,
+            dv.to(x.dtype),
+            mask=mask_k[:, None] & mask_n[None, :],
+        )
+
+    # Write dx
+    tl.atomic_add(dx_ptrs, acc_dx.to(x.dtype), mask=mask_m[:, None] & mask_n[None, :])
 
 
 def omni_expert_forward(
